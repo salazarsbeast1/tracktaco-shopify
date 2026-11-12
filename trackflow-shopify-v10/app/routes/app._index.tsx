@@ -3,6 +3,8 @@ import {useFetcher, useLoaderData, useSearchParams} from "react-router";
 import type {ActionFunctionArgs, LoaderFunctionArgs} from "react-router";
 import {authenticate} from "../shopify.server";
 import prisma from "../db.server";
+import {chunkItems,planBulkCandidates} from "../bulk-planner";
+import type {TrackingAssignment} from "../bulk-planner";
 
 type Order = {id:string; name:string; createdAt:string; displayFulfillmentStatus:string; shippingAddress?:{city:string|null;provinceCode:string|null;countryCodeV2:string|null}|null;
  fulfillmentOrders:{nodes:Array<{id:string;status:string;requestStatus:string;assignedLocation:{location:{id:string}} | null}>}};
@@ -13,13 +15,21 @@ query BulkOrders($after:String,$reverse:Boolean!,$query:String){orders(first:100
  edges{cursor node{id name createdAt displayFulfillmentStatus shippingAddress{city provinceCode countryCodeV2}}}
  pageInfo{hasNextPage endCursor}
 }}`;
+const SELECT_ORDERS = `#graphql
+query SelectOrders($after:String,$reverse:Boolean!,$query:String){orders(first:250,after:$after,sortKey:CREATED_AT,reverse:$reverse,query:$query){
+ edges{node{id name}}
+ pageInfo{hasNextPage endCursor}
+}}`;
 const VERIFY = `#graphql
 query VerifyBulkOrder($id:ID!){order(id:$id){id name displayFulfillmentStatus
  fulfillmentOrders(first:40){nodes{id status requestStatus assignedLocation{location{id}}}}
 }}`;
 const CREATE = `#graphql
 mutation CreateVerifiedFulfillment($fulfillment:FulfillmentInput!){fulfillmentCreate(fulfillment:$fulfillment){fulfillment{id status trackingInfo{number company}} userErrors{message field}}}`;
-const LIMIT = 150;
+const LIMIT = 150; // Separate manual CSV fulfillment limit.
+const MAX_TRACKING_SELECTION = 500;
+const SEARCH_CHUNK_SIZE = 5;
+const REVEAL_CHUNK_SIZE = 25;
 export async function loader({request}:LoaderFunctionArgs){
  const {admin}=await authenticate.admin(request);
  const url=new URL(request.url); const sort=url.searchParams.get("sort")==="old"?"old":"new";
@@ -44,6 +54,32 @@ export async function action({request}:ActionFunctionArgs){
  const {admin,session}=await authenticate.admin(request);
  const form=await request.formData();
  const intent=String(form.get("intent")||"");
+ if(intent==="select_bulk_orders"){
+  try{
+   const status=["unfulfilled","partial","all"].includes(String(form.get("status")||""))?String(form.get("status")):"unfulfilled";
+   const from=String(form.get("from")||"").slice(0,10);
+   const to=String(form.get("to")||"").slice(0,10);
+   const search=String(form.get("search")||"").trim().slice(0,60);
+   const reverse=String(form.get("sort"))!=="old";
+   const terms:string[]=[];
+   if(status==="unfulfilled")terms.push("(fulfillment_status:unfulfilled OR fulfillment_status:partial)");
+   else if(status==="partial")terms.push("fulfillment_status:partial");
+   if(/^\d{4}-\d{2}-\d{2}$/.test(from))terms.push(`created_at:>=${from}`);
+   if(/^\d{4}-\d{2}-\d{2}$/.test(to))terms.push(`created_at:<=${to}`);
+   if(search)terms.push(`name:${search.replace(/[^a-zA-Z0-9#-]/g,"")}`);
+   const rows:Array<{id:string;name:string}>=[];
+   let cursor:string|null=null;
+   for(let page=0;page<3&&rows.length<MAX_TRACKING_SELECTION;page++){
+    const response=await admin.graphql(SELECT_ORDERS,{variables:{after:cursor,reverse,query:terms.join(" AND ")||null}});
+    const body=await response.json();
+    if(!response.ok||body.errors?.length||!body.data?.orders)throw new Error("Shopify could not load the requested orders");
+    rows.push(...(body.data.orders.edges||[]).map((e:any)=>({id:e.node.id,name:e.node.name})));
+    if(!body.data.orders.pageInfo.hasNextPage||!body.data.orders.pageInfo.endCursor)break;
+    cursor=body.data.orders.pageInfo.endCursor;
+   }
+   return Response.json({selection:{orders:rows.slice(0,MAX_TRACKING_SELECTION)}});
+  }catch(e){return Response.json({selection:{error:e instanceof Error?e.message:"Unable to select matching orders"}});}
+ }
  if(intent==="tracktaco_bulk_search"){
   try{
    const key=process.env.TRACKTACO_API_KEY;
@@ -52,7 +88,7 @@ export async function action({request}:ActionFunctionArgs){
    if(!Array.isArray(ids)||ids.length<1||ids.length>5||new Set(ids).size!==ids.length||ids.some((id:unknown)=>typeof id!=="string"||!/^gid:\/\/shopify\/Order\/\d+$/.test(id)))throw new Error("Select 1–5 different orders per free search request");
    const orderQuery=`#graphql
 query BulkLookup($id:ID!){order(id:$id){id name shippingAddress{city provinceCode countryCodeV2} fulfillments(first:20){id trackingInfo{number}}}}`;
-   // Bound each request to five orders: the browser orchestrates up to 100 orders
+   // Bound each request to five orders: the browser orchestrates up to 500 orders
    // in independent requests, so a slow destination never blocks the entire run.
    if(ids.length>5)throw new Error("Maximum five orders per search request; the dashboard handles larger selections automatically");
    const orderResults=await Promise.all(ids.map(async(id:string)=>{
@@ -100,121 +136,67 @@ query BulkLookup($id:ID!){order(id:$id){id name shippingAddress{city provinceCod
    const key=process.env.TRACKTACO_API_KEY;
    if(!key)throw new Error("TrackTaco key not configured");
    const assignments=JSON.parse(String(form.get("assignments")||"[]"));
-   if(!Array.isArray(assignments)||!assignments.length||assignments.length>50)throw new Error("Choose 1–50 candidate records");
-   if(new Set(assignments.map((a:any)=>a.orderId)).size!==assignments.length || new Set(assignments.map((a:any)=>a.tnId)).size!==assignments.length)throw new Error("Duplicate order or tracking candidate detected");
-   if(assignments.some((a:any)=>!/^gid:\/\/shopify\/Order\/\d+$/.test(a.orderId||"")||!/^tn_[a-zA-Z0-9_-]{4,200}$/.test(a.tnId||"")))throw new Error("Invalid bulk reveal selection");
-   const accepted:any[]=[];const failed:any[]=[];
-   // Re-fetch destination from Shopify: never trust addresses passed by browser.
+   if(!Array.isArray(assignments)||!assignments.length||assignments.length>REVEAL_CHUNK_SIZE)throw new Error(`Send 1–${REVEAL_CHUNK_SIZE} records per reveal request; the dashboard processes up to 500 automatically`);
+   const accepted:Array<{a:{orderId:string;tnId:string};order:any;addr:any}>=[];
+   const failed:Array<{orderId:string;error:string}>=[];
+   const seenOrders=new Set<string>();
+   const seenCandidates=new Set<string>();
    const orderQuery=`#graphql
 query VerifyRevealOrder($id:ID!){order(id:$id){id name shippingAddress{city provinceCode countryCodeV2} fulfillments(first:20){id trackingInfo{number}}}}`;
-   for(const a of assignments){
-    const res=await admin.graphql(orderQuery,{variables:{id:a.orderId}});
-    const payload=await res.json();const order=payload.data?.order;
-    if(!res.ok||payload.errors?.length||!order?.shippingAddress?.city||!order.shippingAddress.countryCodeV2){failed.push({orderId:a.orderId,error:"Unable to read Shopify destination"});continue;}
-    const addr=order.shippingAddress;
-    const fulfillments=order.fulfillments||[];
-    if(fulfillments.some((f:any)=>(f.trackingInfo||[]).some((t:any)=>Boolean(t.number)))){failed.push({orderId:a.orderId,error:"Credit protected: Shopify already has shipment tracking. No reveal purchased."});continue;}
-    if(fulfillments.length>1){failed.push({orderId:a.orderId,error:"Credit protected: multiple fulfillments need manual selection. No reveal purchased."});continue;}
-    // Don't re-purchase previously staged records.
-    const existing=await prisma.pendingTracking.findUnique({where:{shop_orderId_tnId:{shop:session.shop,orderId:a.orderId,tnId:a.tnId}}});
-    if(existing){failed.push({orderId:a.orderId,error:"Record already revealed for this order"});continue;}
-    accepted.push({a,order,addr});
+   // Deduplicate and preflight each order independently. One bad record never blocks the batch.
+   for(const raw of assignments){
+    const orderId=typeof raw?.orderId==="string"?raw.orderId:"";
+    const tnId=typeof raw?.tnId==="string"?raw.tnId:"";
+    if(!/^gid:\/\/shopify\/Order\/\d+$/.test(orderId)||!/^tn_[a-zA-Z0-9_-]{4,200}$/.test(tnId)){
+     failed.push({orderId:orderId||"invalid",error:"Skipped invalid order or tracking candidate"});continue;
+    }
+    if(seenOrders.has(orderId)||seenCandidates.has(tnId)){
+     failed.push({orderId,error:"Skipped duplicate order or tracking candidate. No reveal requested."});continue;
+    }
+    seenOrders.add(orderId);seenCandidates.add(tnId);
+    try{
+     const res=await admin.graphql(orderQuery,{variables:{id:orderId}});
+     const payload=await res.json();const order=payload.data?.order;
+     if(!res.ok||payload.errors?.length||!order?.shippingAddress?.city||!order.shippingAddress.countryCodeV2)throw new Error("Unable to read Shopify shipping destination");
+     const addr=order.shippingAddress;
+     const fulfillments=order.fulfillments||[];
+     if(fulfillments.some((f:any)=>(f.trackingInfo||[]).some((t:any)=>Boolean(t.number))))throw new Error("Shopify already has shipment tracking. No reveal purchased.");
+     if(fulfillments.length>1)throw new Error("Multiple fulfillments need manual review. No reveal purchased.");
+     // An existing pending/published record means this order does not need another paid lookup.
+     const previousOrder=await prisma.pendingTracking.findFirst({where:{shop:session.shop,orderId,status:{in:["PENDING","FAILED","PUBLISHED"]}},select:{id:true}});
+     if(previousOrder)throw new Error("Already queued or processed for VA review. No reveal purchased.");
+     const previousCandidate=await prisma.pendingTracking.findFirst({where:{shop:session.shop,tnId},select:{id:true}});
+     if(previousCandidate)throw new Error("Tracking candidate was previously revealed. No new purchase requested.");
+     accepted.push({a:{orderId,tnId},order,addr});
+    }catch(e){failed.push({orderId,error:e instanceof Error?e.message:"Shopify preflight failed; no reveal requested"});}
    }
    if(!accepted.length)return Response.json({bulkReveal:{staged:[],failed,creditsRequested:0}});
+   // One TrackTaco reveal request for the eligible unique records only. Never automatically
+   // retry on an uncertain network response, since a retry might purchase the same credits twice.
    const response=await fetch("https://v2.tracktaco.com/v2/tns/reveal",{method:"POST",headers:{Authorization:`Bearer ${key}`,"Content-Type":"application/json",Accept:"application/json"},body:JSON.stringify({tn_ids:accepted.map(x=>x.a.tnId)}),signal:AbortSignal.timeout(55000)});
    const raw=await response.text();let body:any;
-   try{body=JSON.parse(raw);}catch{throw new Error(`TrackTaco reveal response unreadable (HTTP ${response.status}); check TrackTaco history before retrying to avoid double charges`);}
-   if(!response.ok)throw new Error(`TrackTaco reveal HTTP ${response.status}: ${body?.error?.message||"Request failed"}`);
-   if(!Array.isArray(body?.results))throw new Error("TrackTaco reveal returned no result array; check account history before retrying");
-   const byId=new Map(body.results.map((v:any)=>([v.tn_id,v])));
-   const staged:any[]=[];
+   try{body=JSON.parse(raw);}catch{throw new Error(`TrackTaco reveal response unreadable (HTTP ${response.status}). Check TrackTaco history before retrying to avoid double charges.`);}
+   if(!response.ok)throw new Error(`TrackTaco reveal HTTP ${response.status}: ${body?.error?.message||"Request failed"}. Check charge history before retrying.`);
+   if(!Array.isArray(body?.results))throw new Error("TrackTaco returned no result array. Check purchase history before retrying.");
+   const byId=new Map<string,any>(body.results.filter((r:any)=>typeof r?.tn_id==="string").map((r:any)=>[r.tn_id,r]));
+   const staged:Array<{orderId:string;orderName:string;carrier:string}>=[];
    const same=(a:unknown,b:unknown)=>String(a||"").trim().toUpperCase()===String(b||"").trim().toUpperCase();
    for(let i=0;i<accepted.length;i++){
-    const {a,order,addr}=accepted[i];const entry:any=byId.get(a.tnId)||body.results[i];
-    if(!entry?.tracking_number||!entry?.carrier){failed.push({orderId:a.orderId,error:entry?.error?.message||"No tracking revealed"});continue;}
-    if(!same(entry.dest?.city,addr.city)||!same(entry.dest?.country,addr.countryCodeV2)||(addr.countryCodeV2==="US"&&!same(entry.dest?.state,addr.provinceCode))){failed.push({orderId:a.orderId,error:"Revealed record destination differs from Shopify; not queued"});continue;}
+    const {a,order,addr}=accepted[i];
+    // Trust an explicit tn_id. Positional fallback is safe only when the API supplies NO IDs at all.
+    const noResultIds=byId.size===0;
+    const entry:any=byId.get(a.tnId)||(noResultIds&&body.results.length===accepted.length?body.results[i]:null);
+    if(!entry?.tracking_number||!entry?.carrier){failed.push({orderId:a.orderId,error:entry?.error?.message||"No tracking revealed; check purchase history before retrying"});continue;}
+    if(!same(entry.dest?.city,addr.city)||!same(entry.dest?.country,addr.countryCodeV2)||(addr.countryCodeV2==="US"&&!same(entry.dest?.state,addr.provinceCode))){failed.push({orderId:a.orderId,error:"Revealed destination differs from Shopify. Not queued; check credit history."});continue;}
     try{
+     const inAnotherOrder=await prisma.pendingTracking.findFirst({where:{shop:session.shop,trackingNumber:entry.tracking_number,orderId:{not:a.orderId}},select:{id:true}});
+     if(inAnotherOrder){failed.push({orderId:a.orderId,error:"Tracking number already used on another order. Not queued."});continue;}
      await prisma.pendingTracking.upsert({where:{shop_orderId_tnId:{shop:session.shop,orderId:a.orderId,tnId:a.tnId}},update:{trackingNumber:entry.tracking_number,carrier:entry.carrier.toUpperCase(),status:"PENDING",lastError:null},create:{shop:session.shop,orderId:a.orderId,orderName:order.name,tnId:a.tnId,trackingNumber:entry.tracking_number,carrier:entry.carrier.toUpperCase(),destinationCity:addr.city,destinationState:addr.provinceCode,destinationCountry:addr.countryCodeV2}});
-     staged.push({orderName:order.name,carrier:entry.carrier});
-    }catch(e){failed.push({orderId:a.orderId,error:"Reveal succeeded but queue save failed; do not retry purchase. Contact support."});}
+     staged.push({orderId:a.orderId,orderName:order.name,carrier:entry.carrier});
+    }catch(e){failed.push({orderId:a.orderId,error:"Reveal succeeded but VA queue save failed. Do not purchase again; contact support."});}
    }
-   return Response.json({bulkReveal:{staged,failed,creditsRemaining:body.credits_remaining}});
-  }catch(e){console.error("[tracktaco] Bulk reveal error",e);return Response.json({bulkReveal:{error:e instanceof Error?e.message:"Reveal failed; inspect history before retry"}});}
- }
- if(intent==="tracktaco_search"||intent==="tracktaco_reveal"){
-  try {
-   const key=process.env.TRACKTACO_API_KEY;
-   if(!key)throw new Error("TRACKTACO_API_KEY missing");
-   const orderId=String(form.get("orderId")||"");
-   if(!/^gid:\/\/shopify\/Order\/\d+$/.test(orderId))throw new Error("Invalid order");
-   const orderLookupStarted=Date.now();
-   console.info("[tracktaco] Shopify shipping destination lookup started",{orderId});
-   const check=await admin.graphql(`#graphql
-query GetTrackTacoDestination($id:ID!){order(id:$id){id name shippingAddress{city provinceCode countryCodeV2}}}`,{variables:{id:orderId}});
-   console.info("[tracktaco] Shopify destination lookup completed",{orderId,ms:Date.now()-orderLookupStarted,httpStatus:check.status});
-   const checkPayload=await check.json();
-   if(!check.ok||checkPayload.errors?.length)throw new Error("Shopify order lookup failed");
-   const order=checkPayload.data?.order;
-   if(!order)throw new Error("Order not found");
-   const dest=order.shippingAddress;
-   if(!dest?.countryCodeV2||!dest.city)throw new Error("Order requires a shipping city and country");
-   const api=async(path:string,body:object)=>{
-    const started=Date.now();
-    console.info("[tracktaco] API request started",{path,orderId,destination:dest.city,region:dest.provinceCode,country:dest.countryCodeV2});
-    let res:Response;
-    try {
-     res=await fetch(`https://v2.tracktaco.com${path}`,{method:"POST",headers:{Authorization:`Bearer ${key}`,Accept:"application/json","Content-Type":"application/json"},body:JSON.stringify(body),signal:AbortSignal.timeout(40000)});
-    } catch(e) {
-     console.error("[tracktaco] API request transport error",{path,orderId,ms:Date.now()-started,error:e instanceof Error?e.name:"Unknown"});
-     if(e instanceof Error&&(e.name==="TimeoutError"||e.name==="AbortError"))throw new Error(`TrackTaco API request timed out after ${Math.round((Date.now()-started)/1000)} seconds. No reveal was attempted during free search.`);
-     throw e;
-    }
-    console.info("[tracktaco] API response received",{path,orderId,ms:Date.now()-started,httpStatus:res.status});
-    // Read the raw upstream body first so truncated responses become actionable errors.
-    const raw=await res.text();
-    let json:any=null;
-    try { json=raw ? JSON.parse(raw) : null; }
-    catch { throw new Error(`TrackTaco returned non-JSON (HTTP ${res.status}; content type ${res.headers.get("content-type") || "unknown"}). No credits confirmed spent. Request ID: ${res.headers.get("x-request-id") || "unavailable"}.`); }
-    if(!res.ok){
-     const requestId=json?.error?.request_id || res.headers.get("x-request-id") || "unavailable";
-     throw new Error(`TrackTaco HTTP ${res.status}: ${json?.error?.message || "Request failed"}. Request ID: ${requestId}`);
-    }
-    if(!json || typeof json!=="object") throw new Error(`TrackTaco sent an empty API response (HTTP ${res.status}).`);
-    return json;
-   };
-   if(intent==="tracktaco_search"){
-    const carrier=String(form.get("carrier")||"any");
-    if(!["any","ups","fedex","dhl"].includes(carrier))throw new Error("Invalid carrier");
-    const filter:any={dest:{country:dest.countryCodeV2,city:dest.city.trim().toUpperCase()}};
-    if(dest.countryCodeV2==="US"&&dest.provinceCode)filter.dest.state=dest.provinceCode.toUpperCase();
-    if(carrier!=="any")filter.carrier=[carrier];
-    const search=await api("/v2/tns/search",{searches:[{filter,page_size:25}]});
-    console.info("[tracktaco] Free search completed",{orderId,count:search?.searches?.[0]?.results?.length??0});
-    if (!Array.isArray(search?.searches) || !search.searches[0]) throw new Error("TrackTaco search returned an unexpected response structure. No credits were spent.");
-    const first=search.searches[0];
-    return Response.json({tracktaco:{intent,orderId,orderName:order.name,city:dest.city,state:dest.provinceCode,country:dest.countryCodeV2,hits:first.results||[],error:first.error?.message||null}});
-   }
-   if(form.get("confirmSpend")!=="yes")throw new Error("Credit-spend confirmation required");
-   const tnId=String(form.get("tnId")||"");
-   if(!/^tn_[a-zA-Z0-9_-]{4,200}$/.test(tnId))throw new Error("Invalid TrackTaco record");
-   const revealed=await api("/v2/tns/reveal",{tn_ids:[tnId]});
-   const entry=revealed?.results?.[0];
-   let staged=false;
-   // A destination match creates a review candidate, never proof of shipment ownership.
-   if(entry?.outcome==="revealed" && entry.tracking_number && entry.carrier){
-     const found=entry.dest;
-     const same=(a:unknown,b:unknown)=>String(a||"").trim().toUpperCase()===String(b||"").trim().toUpperCase();
-     if(!same(found?.city,dest.city)||!same(found?.country,dest.countryCodeV2)||
-       (dest.countryCodeV2==="US"&&!same(found?.state,dest.provinceCode))){
-       throw new Error("TrackTaco revealed a record with a different destination. No Shopify tracking was changed. Check TrackTaco account history before trying another reveal.");
-     }
-     await prisma.pendingTracking.upsert({where:{shop_orderId_tnId:{shop:session.shop,orderId,tnId}},
-       update:{trackingNumber:entry.tracking_number,carrier:entry.carrier.toUpperCase(),status:"PENDING",lastError:null},
-       create:{shop:session.shop,orderId,orderName:order.name,tnId,trackingNumber:entry.tracking_number,carrier:entry.carrier.toUpperCase(),destinationCity:dest.city,destinationState:dest.provinceCode,destinationCountry:dest.countryCodeV2}});
-     staged=true;
-   }
-   return Response.json({tracktaco:{intent,orderId,orderName:order.name,city:dest.city,state:dest.provinceCode,country:dest.countryCodeV2,revealed:entry||null,staged,credits_remaining:revealed?.credits_remaining}});
-  }catch(e){console.error("[tracktaco] Order lookup/search failed",{intent,error:e instanceof Error?e.message:"Unknown failure"});return Response.json({tracktaco:{intent,error:e instanceof Error?e.message:"Unknown failure"}});}
+   return Response.json({bulkReveal:{staged,failed,creditsRequested:accepted.length,creditsRemaining:body.credits_remaining}});
+  }catch(e){console.error("[tracktaco] Bulk reveal error",e);return Response.json({bulkReveal:{error:e instanceof Error?e.message:"Reveal failed; inspect history before retrying"}});}
  }
  if(intent!=="fulfill")return Response.json({error:"Invalid request"},{status:400});
  if(form.get("confirmed")!=="yes"||form.get("shipmentVerified")!=="yes")return Response.json({error:"Explicit confirmation and shipment verification are required"},{status:400});
@@ -257,8 +239,12 @@ const button:React.CSSProperties={border:"1px solid #b8bdc5",borderRadius:8,padd
 export default function BulkDashboard(){
  const {orders,nextCursor,sort,status,from,to,search}=useLoaderData<typeof loader>();
  const [params,setParams]=useSearchParams();
- const fetcher=useFetcher<typeof action>();
- const batchFetcher=useFetcher<typeof action>();
+ const fetcher=useFetcher<typeof action>(); // Separate manual CSV fulfillment
+ const searchFetcherA=useFetcher<typeof action>();
+ const searchFetcherB=useFetcher<typeof action>();
+ const searchFetcherC=useFetcher<typeof action>();
+ const revealFetcher=useFetcher<typeof action>();
+ const selectionFetcher=useFetcher<typeof action>();
  const [selected,setSelected]=useState<Record<string,{name:string;tracking:string;carrier:string}>>({});
  const [review,setReview]=useState(false),[agree,setAgree]=useState(false);
  const [filter,setFilter]=useState("");
@@ -269,51 +255,100 @@ export default function BulkDashboard(){
  const picked=Object.entries(selected);
  const count=picked.length;
  const all=filtered.length>0&&filtered.every(o=>!!selected[o.id]);
- const change=(o:Order)=>setSelected(prev=>{const next={...prev};if(next[o.id])delete next[o.id];else next[o.id]={name:o.name,tracking:"",carrier:"UPS"};return next;});
+ const [batchResults,setBatchResults]=useState<any[]>([]);
+ const searchQueueRef=useRef<string[][]>([]);
+ const searchActiveRef=useRef(false);
+ const searchPendingRef=useRef([0,0,0]);
+ const searchStopRef=useRef(false);
+ const [progress,setProgress]=useState({done:0,total:0,active:false,stopped:false});
+ const [batchFailures,setBatchFailures]=useState<string[]>([]);
+ const revealQueueRef=useRef<TrackingAssignment[][]>([]);
+ const revealChunkRef=useRef<TrackingAssignment[]>([]);
+ const revealActiveRef=useRef(false);
+ const [revealProgress,setRevealProgress]=useState({done:0,total:0,staged:0,skipped:0,active:false,creditsRemaining:null as number|null});
+ const [revealIssues,setRevealIssues]=useState<string[]>([]);
+ const [revealAttempted,setRevealAttempted]=useState(false);
+ const [revealStopped,setRevealStopped]=useState(false);
+ const processing=busy||progress.active||revealProgress.active||selectionFetcher.state!=="idle";
+ const clearSearchPreview=()=>{setBatchResults([]);setBatchFailures([]);setProgress({done:0,total:0,active:false,stopped:false});setRevealAttempted(false);setRevealIssues([]);setRevealStopped(false);setRevealProgress({done:0,total:0,staged:0,skipped:0,active:false,creditsRemaining:null});};
+ const change=(o:Order)=>{clearSearchPreview();setSelected(prev=>{const next={...prev};if(next[o.id])delete next[o.id];else if(Object.keys(next).length<MAX_TRACKING_SELECTION)next[o.id]={name:o.name,tracking:"",carrier:"UPS"};return next;});};
  const updateFilters=(key:string,value:string)=>{const p=new URLSearchParams(params);p.set(key,value);p.delete("after");setParams(p);setReview(false)};
  const switchSort=(value:string)=>updateFilters("sort",value);
  const next=()=>{if(nextCursor){const p=new URLSearchParams(params);p.set("after",nextCursor);setParams(p);}setReview(false)};
  const previous=()=>{const p=new URLSearchParams(params);p.delete("after");setParams(p);setReview(false)};
- const resultData=fetcher.data as {results?:Result[];error?:string;tracktaco?:any;bulkSearch?:{results?:any[];error?:string};bulkReveal?:{staged?:any[];failed?:any[];error?:string;creditsRemaining?:number}}|undefined;
- const [batchResults,setBatchResults]=useState<any[]>([]);
- const queueRef=useRef<string[][]>([]);
- const activeRef=useRef(false);
- const [progress,setProgress]=useState({done:0,total:0,active:false});
- const [batchFailures,setBatchFailures]=useState<string[]>([]);
+ const resultData=fetcher.data as {results?:Result[];error?:string}|undefined;
+ useEffect(()=>{
+  const data=(selectionFetcher.data as {selection?:{orders?:Array<{id:string;name:string}>;error?:string}}|undefined)?.selection;
+  if(!data?.orders)return;
+  setSelected(Object.fromEntries(data.orders.slice(0,MAX_TRACKING_SELECTION).map(o=>[o.id,{name:o.name,tracking:"",carrier:"UPS"}])));
+  setReview(false);
+  clearSearchPreview();
+ },[selectionFetcher.data]);
+ const searchWorkers=[searchFetcherA,searchFetcherB,searchFetcherC] as const;
+ const startSearchWorker=(slot:0|1|2)=>{
+  if(searchStopRef.current)return;
+  const chunk=searchQueueRef.current.shift();
+  if(!chunk)return;
+  searchPendingRef.current[slot]=chunk.length;
+  searchWorkers[slot].submit({intent:"tracktaco_bulk_search",orderIds:JSON.stringify(chunk)},{method:"post"});
+ };
  const launchBulk=()=>{
-  const ids=picked.map(([id])=>id).slice(0,100);
-  const groups:string[][]=[];
-  for(let i=0;i<ids.length;i+=5)groups.push(ids.slice(i,i+5));
-  queueRef.current=groups.slice(1);
-  activeRef.current=true;
-  setBatchResults([]);
-  setBatchFailures([]);
-  setProgress({done:0,total:ids.length,active:true});
-  batchFetcher.submit({intent:"tracktaco_bulk_search",orderIds:JSON.stringify(groups[0])},{method:"post"});
+  const ids=picked.map(([id])=>id).slice(0,MAX_TRACKING_SELECTION);
+  if(!ids.length||progress.active||revealProgress.active)return;
+  const groups=chunkItems(ids,SEARCH_CHUNK_SIZE);
+  searchQueueRef.current=groups;
+  searchPendingRef.current=[0,0,0];
+  searchStopRef.current=false;
+  searchActiveRef.current=true;
+  setBatchResults([]);setBatchFailures([]);setRevealIssues([]);setRevealAttempted(false);setRevealStopped(false);
+  setRevealProgress({done:0,total:0,staged:0,skipped:0,active:false,creditsRemaining:null});
+  setProgress({done:0,total:ids.length,active:true,stopped:false});
+  startSearchWorker(0);startSearchWorker(1);startSearchWorker(2);
+ };
+ const receiveSearch=(slot:0|1|2,result:{results?:any[];error?:string})=>{
+  if(!searchActiveRef.current||!searchPendingRef.current[slot])return;
+  const size=searchPendingRef.current[slot];
+  searchPendingRef.current[slot]=0;
+  if(Array.isArray(result.results))setBatchResults(old=>[...old,...result.results!]);
+  if(result.error)setBatchFailures(old=>[...old,`Search group: ${result.error}`]);
+  setProgress(old=>({...old,done:Math.min(old.total,old.done+size)}));
+  startSearchWorker(slot);
+  if(searchPendingRef.current.every(n=>n===0)&&searchQueueRef.current.length===0){
+   searchActiveRef.current=false;
+   setProgress(old=>({...old,active:false,stopped:searchStopRef.current}));
+  }
+ };
+ useEffect(()=>{const response=(searchFetcherA.data as {bulkSearch?:{results?:any[];error?:string}}|undefined)?.bulkSearch;if(response)receiveSearch(0,response);},[searchFetcherA.data]);
+ useEffect(()=>{const response=(searchFetcherB.data as {bulkSearch?:{results?:any[];error?:string}}|undefined)?.bulkSearch;if(response)receiveSearch(1,response);},[searchFetcherB.data]);
+ useEffect(()=>{const response=(searchFetcherC.data as {bulkSearch?:{results?:any[];error?:string}}|undefined)?.bulkSearch;if(response)receiveSearch(2,response);},[searchFetcherC.data]);
+ // Search results select at most one unique candidate for each order. No Shopify writes.
+ const planned=useMemo(()=>planBulkCandidates(batchResults),[batchResults]);
+ const submitRevealChunk=(chunk:TrackingAssignment[])=>{
+  revealChunkRef.current=chunk;
+  revealFetcher.submit({intent:"tracktaco_bulk_reveal",assignments:JSON.stringify(chunk.map(({orderId,tnId})=>({orderId,tnId}))),confirmSpend:"yes"},{method:"post"});
+ };
+ const launchReveal=()=>{
+  if(!planned.assignments.length||progress.active||revealProgress.active||revealAttempted)return;
+  const groups=chunkItems(planned.assignments,REVEAL_CHUNK_SIZE);
+  setRevealAttempted(true);setRevealIssues([]);setRevealStopped(false);
+  setRevealProgress({done:0,total:planned.assignments.length,staged:0,skipped:0,active:true,creditsRemaining:null});
+  revealQueueRef.current=groups.slice(1);
+  revealActiveRef.current=true;
+  submitRevealChunk(groups[0]);
  };
  useEffect(()=>{
-  const result=(batchFetcher.data as {bulkSearch?:{results?:any[];error?:string}}|undefined)?.bulkSearch;
-  if(!result||!activeRef.current)return;
-  const rows=result.results||[];
-  setBatchResults(old=>[...old,...rows]);
-  if(result.error)setBatchFailures(old=>[...old,result.error!]);
-  const processed=rows.length || 5;
-  setProgress(old=>({done:Math.min(old.total,old.done+processed),total:old.total,active:queueRef.current.length>0}));
-  const next=queueRef.current.shift();
-  if(next)batchFetcher.submit({intent:"tracktaco_bulk_search",orderIds:JSON.stringify(next)},{method:"post"});
-  else activeRef.current=false;
- },[batchFetcher.data]);
- const [ttOrderId,setTtOrderId]=useState("");
- const [ttCarrier,setTtCarrier]=useState("any");
- const [ttSelected,setTtSelected]=useState<any>(null);
- const [ttHits,setTtHits]=useState<any[]>([]);
- const [ttOrderDest,setTtOrderDest]=useState("");
- const [ttReveal,setTtReveal]=useState<any>(null);
-
- useEffect(()=>{const t=resultData?.tracktaco;if(!t)return;
-  if(t.intent==="tracktaco_search"&&!t.error){setTtHits(t.hits||[]);setTtSelected(null);setTtReveal(null);setTtOrderDest(`${t.orderName} · ${t.city}, ${t.state||t.country}`);}
-  if(t.intent==="tracktaco_reveal"&&!t.error){setTtReveal(t);}
- },[resultData]);
+  const result=(revealFetcher.data as {bulkReveal?:{staged?:any[];failed?:Array<{orderId:string;error:string}>;error?:string;creditsRemaining?:number}}|undefined)?.bulkReveal;
+  if(!result||!revealActiveRef.current)return;
+  const current=revealChunkRef.current;
+  const staged=result.staged?.length||0;
+  const skipped=result.error?current.length:(result.failed?.length||0);
+  if(result.error)setRevealIssues(old=>[...old,`A group of ${current.length} orders could not complete: ${result.error}`]);
+  else if(result.failed?.length)setRevealIssues(old=>[...old,...result.failed!.map(v=>`${v.orderId.split("/").pop()}: ${v.error}`)]);
+  const nextChunk=revealQueueRef.current.shift();
+  setRevealProgress(old=>({done:Math.min(old.total,old.done+current.length),total:old.total,staged:old.staged+staged,skipped:old.skipped+skipped,active:!!nextChunk,creditsRemaining:typeof result.creditsRemaining==="number"?result.creditsRemaining:old.creditsRemaining}));
+  if(nextChunk)submitRevealChunk(nextChunk);
+  else revealActiveRef.current=false;
+ },[revealFetcher.data]);
  const parsed=useMemo(()=>{
   const map=new Map<string,{tracking:string;carrier:string}>();
   const errors:string[]=[];
@@ -347,69 +382,62 @@ export default function BulkDashboard(){
    <input placeholder="Filter loaded page" value={filter} onChange={e=>setFilter(e.target.value)} style={{...button,minWidth:180}} />
   </div>
   <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:12}}>
-   <button style={button} onClick={()=>setSelected(prev=>{const next={...prev};for(const o of filtered){if(!all)next[o.id]=next[o.id]||{name:o.name,tracking:"",carrier:"UPS"};else delete next[o.id];}return next;})}>{all?"Deselect visible":"Select all visible"}</button>
-   <button style={button} onClick={()=>setSelected({})} disabled={!count}>Clear selection</button>
-   <button style={button} onClick={()=>{setParams({sort:"new",status:"unfulfilled"});setSearchDraft("");setFilter("")}}>Reset filters</button>
-   <button style={{...button,background:count?"#1d5fd1":"#dfe3e8",color:count?"white":"#444"}} disabled={!count||busy} onClick={()=>{setReview(true);setAgree(false);}}>Review {count} orders</button>
+   <button style={button} disabled={processing} onClick={()=>{clearSearchPreview();setSelected(prev=>{const next={...prev};for(const o of filtered){if(!all){if(next[o.id]||Object.keys(next).length<MAX_TRACKING_SELECTION)next[o.id]=next[o.id]||{name:o.name,tracking:"",carrier:"UPS"};}else delete next[o.id];}return next;});}}>{all?"Deselect visible":"Select all visible"}</button>
+   <button style={button} onClick={()=>{setSelected({});clearSearchPreview();}} disabled={!count||processing}>Clear selection</button>
+   <button style={{...button,borderColor:"#077e53",color:"#077e53"}} disabled={processing} onClick={()=>selectionFetcher.submit({intent:"select_bulk_orders",sort,status,from,to,search},{method:"post"})}>{selectionFetcher.state!=="idle"?"Selecting matching orders…":"Select up to 500 matching orders"}</button>
+   <button style={button} disabled={processing} onClick={()=>{setParams({sort:"new",status:"unfulfilled"});setSearchDraft("");setFilter("")}}>Reset filters</button>
+   <button style={{...button,background:count?"#1d5fd1":"#dfe3e8",color:count?"white":"#444"}} disabled={!count||processing} onClick={()=>{setReview(true);setAgree(false);}}>Manual CSV fulfillment ({count})</button>
   </div>
+  {(selectionFetcher.data as {selection?:{error?:string}}|undefined)?.selection?.error&&<p role="alert" style={{color:"#b42318"}}>{(selectionFetcher.data as {selection:{error:string}}).selection.error}</p>}
   <div style={{border:"1px solid #dce1e8",borderRadius:12,overflow:"hidden"}}>
    {filtered.map(o=><label key={o.id} style={{display:"flex",alignItems:"center",gap:14,padding:"12px 15px",borderBottom:"1px solid #e6e8ec",background:selected[o.id]?"#f0f7ff":"white"}}>
-     <input type="checkbox" checked={!!selected[o.id]} onChange={()=>change(o)} disabled={busy}/>
+     <input type="checkbox" checked={!!selected[o.id]} onChange={()=>change(o)} disabled={processing||(!selected[o.id]&&count>=MAX_TRACKING_SELECTION)}/>
      <strong style={{minWidth:95}}>{o.name}</strong><span style={{flex:1}}>{new Date(o.createdAt).toLocaleDateString()}</span>
      <span style={{fontSize:12,color:"#586879"}}>{o.displayFulfillmentStatus.replaceAll("_"," ")}</span>
    </label>)}
    {!filtered.length&&<p style={{padding:16}}>No matching unfulfilled orders on this page.</p>}
   </div>
   <div style={{display:"flex",gap:8,marginTop:14,alignItems:"center"}}>
-   <button style={button} onClick={previous} disabled={!params.get("after")||busy}>Back to first page</button>
-   <button style={button} onClick={next} disabled={!nextCursor||busy}>Next 100 orders →</button>
-   <span style={{fontSize:12,color:"#667085"}}>Selections are kept when navigating pages. Select across pages. Maximum {LIMIT} per fulfillment submission; additional batches are supported.</span>
+   <button style={button} onClick={previous} disabled={!params.get("after")||processing}>Back to first page</button>
+   <button style={button} onClick={next} disabled={!nextCursor||processing}>Next 100 orders →</button>
+   <span style={{fontSize:12,color:"#667085"}}>Selections stay checked across pages. Select up to {MAX_TRACKING_SELECTION} orders for bulk TrackTaco lookup. Manual CSV fulfillment separately supports {LIMIT} per submission.</span>
   </div>
  </s-section>
- <s-section heading="Bulk TrackTaco destination search">
-  <p>Select up to 100 Shopify orders. The app searches five at a time, automatically continues, and keeps completed results if a later request fails. Free search does not use credits or publish tracking. Leave this tab open while it runs.</p>
+ <s-section heading="Bulk TrackTaco search → VA verification">
+  <p>Select up to <strong>500 Shopify orders</strong> across pages. The app automatically searches in small groups (up to three groups at once), finds one unique tracking candidate per eligible order, and prepares a single batch for the VA queue. Free searches do not spend credits or fulfill orders.</p>
   <div style={{display:"flex",gap:10,flexWrap:"wrap",alignItems:"center"}}>
-   <button style={{...button,background:"linear-gradient(110deg,#086342,#14c87e)",color:"white"}} disabled={!count||count>100||progress.active||batchFetcher.state!=="idle"||busy} onClick={launchBulk}>Search TrackTaco for {count} selected order(s) — free</button>
-   {progress.active&&<button style={button} onClick={()=>{queueRef.current=[];setProgress(old=>({...old,active:false}));}}>Stop after current five</button>}
+   <button style={{...button,background:"linear-gradient(110deg,#086342,#14c87e)",color:"white"}} disabled={!count||count>MAX_TRACKING_SELECTION||progress.active||revealProgress.active||searchWorkers.some(w=>w.state!=="idle")||revealFetcher.state!=="idle"||busy} onClick={launchBulk}>Search TrackTaco for {count} selected order(s) — free</button>
+   {progress.active&&<button style={button} onClick={()=>{searchStopRef.current=true;searchQueueRef.current=[];}}>Stop after current groups</button>}
   </div>
-  {count>100&&<p>Select at most 100 orders per search run; previous selections are retained.</p>}
+  {count>=MAX_TRACKING_SELECTION&&<p style={{fontSize:12,color:"#667085"}}>500-order selection limit reached. Clear or deselect orders to start another batch.</p>}
   {progress.total>0&&<div role="status" aria-live="polite" style={{marginTop:12}}>
-   <div><strong>{progress.active?"Searching destinations…":"Search run finished"}</strong> {progress.done} of {progress.total} orders processed ({Math.round(100*progress.done/progress.total)}%)</div>
+   <div><strong>{progress.active?"Searching orders…":progress.stopped?"Search stopped":"Search finished"}</strong> · {progress.done} of {progress.total} orders processed ({Math.round(100*progress.done/progress.total)}%)</div>
    <progress value={progress.done} max={progress.total} style={{width:"100%",height:18,marginTop:7}} />
-   <div style={{fontSize:12,color:"#667085"}}>Completed results appear below as each batch finishes. Some destinations may have no records.</div>
+   <div style={{fontSize:12,color:"#667085"}}>Completed groups are saved on this page. Keep this tab open until the search is finished.</div>
   </div>}
-  {batchFailures.map((message,i)=><p key={i} role="alert" style={{color:"#b42318"}}>Batch error: {message}</p>)}
+  {!!batchFailures.length&&<details style={{marginTop:12,color:"#b42318"}}><summary>{batchFailures.length} search group error(s) — see details</summary>{batchFailures.map((message,i)=><p key={i}>{message}</p>)}</details>}
   {!!batchResults.length&&<div style={{marginTop:14,padding:14,border:"1px solid #dde3e9",borderRadius:10}}>
-   <strong>Bulk tracking candidates</strong>
-   <p>Unfulfilled orders are eligible for lookup and VA review. Orders with existing supplier tracking are skipped before credits are spent. Destination matching alone is not proof that tracking belongs to an order.</p>
-   <p>{batchResults.filter(r=>r.hits?.length).length} orders with candidates · Estimated maximum {batchResults.filter(r=>r.hits?.length).reduce((n,r)=>n+Number(r.hits[0]?.reveal_cost_credits??1),0)} credits (actual cost determined by TrackTaco).</p>
-   <button style={{...button,background:"linear-gradient(110deg,#086342,#14c87e)",color:"white"}} disabled={busy||progress.active||!batchResults.some(r=>r.hits?.length)} onClick={()=>{
-    const assignments=batchResults.filter(r=>r.hits?.length).map(r=>({orderId:r.orderId,tnId:r.hits[0].tn_id}));
-    const credits=batchResults.filter(r=>r.hits?.length).reduce((n,r)=>n+Number(r.hits[0]?.reveal_cost_credits??1),0);
-    if(window.confirm(`Reveal ${assignments.length} tracking records? TrackTaco may charge approximately ${credits} credits. Revealed numbers go to your private VA queue, not Shopify.`)) fetcher.submit({intent:"tracktaco_bulk_reveal",assignments:JSON.stringify(assignments),confirmSpend:"yes"},{method:"post"});
-   }}>Confirm batch reveal & send to VA queue</button>
-   <p style={{fontSize:12}}>Preflight checks run again before credit spending. Any skipped order costs no reveal credits. Review shipment identity before paying.</p>
+   <strong>Ready to send to VA verification</strong>
+   <div style={{display:"flex",gap:18,flexWrap:"wrap",margin:"12px 0"}}>
+    <span><strong>{planned.assignments.length}</strong> candidate(s) automatically selected</span>
+    <span><strong>{planned.noCandidate}</strong> unavailable / skipped</span>
+    <span><strong>{planned.duplicates}</strong> duplicate candidate(s) skipped</span>
+   </div>
+   <p>One unique candidate is selected automatically for each eligible order. There is no need to open records individually. Existing tracking, already-queued orders and duplicates are checked again before purchasing; ineligible records are skipped without blocking the rest.</p>
+   <p><strong>Estimated maximum TrackTaco reveal cost: {planned.estimatedCredits} credits.</strong> Actual charges depend on TrackTaco and the orders that pass the final checks. The free search has not spent credits.</p>
+   <button style={{...button,background:"linear-gradient(110deg,#086342,#14c87e)",color:"white"}} disabled={processing||revealAttempted||!planned.assignments.length||searchWorkers.some(w=>w.state!=="idle")||revealFetcher.state!=="idle"} onClick={launchReveal}>{revealProgress.active?"Sending eligible records to VA queue…":revealAttempted?"Batch already submitted — see results below":`Confirm paid reveal & send ${planned.assignments.length} to VA queue`}</button>
+   <p style={{fontSize:12,color:"#667085"}}>Clicking Confirm authorizes TrackTaco credits for eligible reveals. No extra popup or individual selection is required. Revealed records go only to your private VA queue; Shopify is not updated until actual shipment tracking is verified.</p>
   </div>}
-  {resultData?.bulkReveal?.error&&<p role="alert" style={{color:"#b42318"}}>{resultData.bulkReveal.error}</p>}
-  {resultData?.bulkReveal?.staged&&<div role="status"><p>{resultData.bulkReveal.staged.length} records saved for VA review. Credits remaining: {resultData.bulkReveal.creditsRemaining??"check TrackTaco"}. <a href="/app/verification">Open VA Bulk Verification</a></p>{resultData.bulkReveal.failed?.map((v,i)=><p key={i} style={{color:"#b42318"}}>{v.orderId}: {v.error}</p>)}</div>}
-  {!!batchResults.length&&<table style={{width:"100%",marginTop:12}}><thead><tr><th>Order</th><th>Destination</th><th>Results</th><th>Next step</th></tr></thead><tbody>{batchResults.map(r=><tr key={r.orderId}><td>{r.orderName}</td><td>{r.city}, {r.state||r.country}</td><td>{r.error||`${r.hits.length} available`}</td><td><button style={button} disabled={!r.hits.length} onClick={()=>{setTtOrderId(r.orderId);setTtOrderDest(`${r.orderName} · ${r.city}, ${r.state||r.country}`);setTtHits(r.hits);setTtSelected(null);setTtReveal(null);}}>Review records</button></td></tr>)}</tbody></table>}
- </s-section>
- <s-section heading="TrackTaco destination lookup · real API test">
- <p>Select an order to search its shipping city and country automatically. For US destinations, the state is also included. Search is free; revealing one record costs credits. Search results do not establish shipment ownership.</p>
- <div style={{display:"flex",gap:10,flexWrap:"wrap",alignItems:"center",marginBottom:12}}>
-  <select aria-label="Order for TrackTaco search" style={button} value={ttOrderId} onChange={e=>{setTtOrderId(e.target.value);setTtHits([]);setTtSelected(null);setTtReveal(null)}}>
-   <option value="">Select a loaded order…</option>
-   {orders.map(o=><option key={o.id} value={o.id}>{o.name} — {o.shippingAddress?.city||"No city"}, {o.shippingAddress?.provinceCode||"?"}</option>)}
-  </select>
-  <select style={button} value={ttCarrier} onChange={e=>setTtCarrier(e.target.value)}><option value="any">All carriers</option><option value="ups">UPS</option><option value="fedex">FedEx</option><option value="dhl">DHL</option></select>
-  <button style={{...button,background:"linear-gradient(110deg,#086342,#14c87e)",color:"white"}} disabled={!ttOrderId||busy} onClick={()=>fetcher.submit({intent:"tracktaco_search",orderId:ttOrderId,carrier:ttCarrier},{method:"post"})}>Search TrackTaco for selected order (free)</button>
- </div>
- {ttOrderDest&&<p><strong>Last search:</strong> {ttOrderDest}</p>}
- {resultData?.tracktaco?.error&&<p role="alert" style={{color:"#a12222"}}>{resultData.tracktaco.error}</p>}
- {!!ttHits.length&&<div style={{maxHeight:300,overflow:"auto",border:"1px solid #ddd",borderRadius:8}}>{ttHits.map(h=><label key={h.tn_id} style={{display:"flex",gap:12,padding:10,borderBottom:"1px solid #eee",alignItems:"center"}}><input type="radio" checked={ttSelected?.tn_id===h.tn_id} onChange={()=>setTtSelected(h)}/><strong>{h.carrier?.toUpperCase()}</strong><span>{h.dest?.city}, {h.dest?.state} · {h.status} · {h.est_delivery_date||"Date unknown"}</span><span style={{marginLeft:"auto"}}>{h.reveal_cost_credits??1} credit</span></label>)}</div>}
- {resultData?.tracktaco?.intent==="tracktaco_search"&&!resultData.tracktaco.error&&!ttHits.length&&<p>No destination matches returned.</p>}
- {ttSelected&&<div style={{marginTop:12,padding:14,background:"#f3f5f9",borderRadius:10}}><p>Reveal this record? TrackTaco may charge {ttSelected.reveal_cost_credits??1} credit. This only retrieves existing tracking data; a matching destination does not prove this tracking belongs to your order.</p><button disabled={busy} style={{...button,background:"linear-gradient(110deg,#086342,#14c87e)",color:"white"}} onClick={()=>fetcher.submit({intent:"tracktaco_reveal",orderId:ttOrderId,tnId:ttSelected.tn_id,confirmSpend:"yes"},{method:"post"})}>Confirm paid reveal</button></div>}
- {ttReveal&&<p role="status"><strong>TrackTaco reveal:</strong> {ttReveal.revealed?.outcome} · {ttReveal.revealed?.carrier} · {ttReveal.revealed?.tracking_number||ttReveal.revealed?.error?.message||"No number"}. Credits left: {ttReveal.credits_remaining??"unavailable"}. {ttReveal.staged?" Saved to VA verification queue; not published to Shopify.":" Not published to Shopify."} <a href="/app/verification">Open VA review</a></p>}
+  {revealProgress.total>0&&<div role="status" aria-live="polite" style={{marginTop:14,padding:14,border:"1px solid #cde2d7",borderRadius:10,background:"#f2fbf6"}}>
+   <strong>{revealProgress.active?"Sending to VA queue…":revealStopped?"Batch stopped after current group":"Batch complete"}</strong>
+   <div style={{marginTop:8}}>{revealProgress.done} of {revealProgress.total} processed · <strong>{revealProgress.staged} queued</strong> · {revealProgress.skipped} skipped or unsuccessful</div>
+   <progress value={revealProgress.done} max={revealProgress.total} style={{width:"100%",height:18,marginTop:8}}/>
+   {revealProgress.active&&<button style={button} onClick={()=>{revealQueueRef.current=[];setRevealStopped(true);}}>Stop after current paid group</button>}
+   <p>Credits remaining: {revealProgress.creditsRemaining??"check TrackTaco account"}. A skipped order does not prevent other orders from processing. Some failures may require a purchase-history check before retrying.</p>
+   <a href="/app/verification" style={{fontWeight:700}}>Open VA Bulk Verification →</a>
+  </div>}
+  {!!revealIssues.length&&<details style={{marginTop:12,color:"#9a3412"}}><summary>{revealIssues.length} skipped or unsuccessful order(s) — show details</summary><div style={{maxHeight:240,overflowY:"auto"}}>{revealIssues.map((issue,i)=><p key={i}>{issue}</p>)}</div></details>}
+  {progress.total>0&&!progress.active&&!batchResults.length&&<p>No candidate results were returned. See any group errors above and try a new free search; no paid reveal was requested.</p>}
  </s-section>
  {review&&<s-section heading={`Review ${count} selected orders`}>
   <p>All selected orders can be confirmed in one batch. No individual tracking fields are required. For Shopify fulfillment, import the real carrier tracking data corresponding to each shipped order from Ship to the Moon (or your actual carrier).</p>
@@ -421,9 +449,9 @@ export default function BulkDashboard(){
   <div style={{maxHeight:160,overflowY:"auto",border:"1px solid #ddd",borderRadius:9,padding:10}}>{readyRows.map(r=><div key={r.id} style={{display:"flex",gap:8,justifyContent:"space-between",padding:4}}><strong>{r.name}</strong><span>{r.tracking?`${r.carrier} · ${r.tracking}`:"No matching shipment tracking"}</span></div>)}</div>
   {count>LIMIT&&<p role="alert">Select at most {LIMIT} orders per submission.</p>}
   <label style={{display:"flex",gap:10,alignItems:"flex-start",margin:"18px 0"}}><input type="checkbox" checked={agree} onChange={e=>setAgree(e.target.checked)}/><span>I confirm the selected orders have already shipped through Ship to the Moon and that each imported tracking number belongs to the corresponding customer's actual shipment. I understand Shopify will mark these orders fulfilled.</span></label>
-  <button style={{...button,background:"linear-gradient(110deg,#086342,#14c87e)",color:"white"}} disabled={!agree||!count||!valid||count>LIMIT||busy} onClick={()=>fetcher.submit({intent:"fulfill",confirmed:"yes",shipmentVerified:"yes",rows:JSON.stringify(readyRows.map(({id,tracking,carrier})=>({id,tracking,carrier})))},{method:"post"})}>{busy?"Processing…":`Confirm and fulfill ${count} orders`}</button>{" "}
-  <button style={button} disabled={busy} onClick={()=>setReview(false)}>Cancel</button>
-  <p style={{fontSize:12,color:"#657080"}}>TrackTaco searches and paid reveals are available on the separate API tests page. A TrackTaco record isn't automatically matched to an order merely because the destination and date are similar.</p>
+  <button style={{...button,background:"linear-gradient(110deg,#086342,#14c87e)",color:"white"}} disabled={!agree||!count||!valid||count>LIMIT||processing} onClick={()=>fetcher.submit({intent:"fulfill",confirmed:"yes",shipmentVerified:"yes",rows:JSON.stringify(readyRows.map(({id,tracking,carrier})=>({id,tracking,carrier})))},{method:"post"})}>{busy?"Processing…":`Confirm and fulfill ${count} orders`}</button>{" "}
+  <button style={button} disabled={processing} onClick={()=>setReview(false)}>Cancel</button>
+  <p style={{fontSize:12,color:"#657080"}}>The automated TrackTaco workflow above stages tracking for VA verification. This separate manual CSV option is only for carrier tracking independently verified as belonging to an already-shipped order.</p>
  </s-section>}
  {(resultData?.error||resultData?.results)&&<s-section heading="Fulfillment results">
   {resultData?.error&&<p role="alert">{resultData.error}</p>}
