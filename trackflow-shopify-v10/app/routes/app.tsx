@@ -43,7 +43,7 @@ export default function App() {
       <div className="trackflow-shell">
         <header className="trackflow-brand">
           <div className="trackflow-logo-wrap"><img className="trackflow-logo" src="/images/trackflow-logo.png" alt="Trackflow.ai" /></div>
-          <div className="trackflow-meta"><strong>Tracking Operations <span style={{display:"inline-block",marginLeft:10,padding:"3px 8px",borderRadius:99,background:"#115b3e",color:"#b9ffdf",fontSize:11,verticalAlign:"middle"}}>V10 · Unfulfilled orders enabled</span></strong>TrackTaco integration · VA verification · Shopify</div>
+          <div className="trackflow-meta"><strong>Tracking Operations <span style={{display:"inline-block",marginLeft:10,padding:"3px 8px",borderRadius:99,background:"#115b3e",color:"#b9ffdf",fontSize:11,verticalAlign:"middle"}}>V11 · 500-order VA queue</span></strong>TrackTaco integration · VA verification · Shopify</div>
         </header>
         <Outlet />
       </div>

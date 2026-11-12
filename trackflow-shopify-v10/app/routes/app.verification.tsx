@@ -12,7 +12,7 @@ const UPDATE=`#graphql
 mutation UpdateTracking($id:ID!,$tracking:FulfillmentTrackingInput!){fulfillmentTrackingInfoUpdate(fulfillmentId:$id,trackingInfoInput:$tracking){fulfillment{id trackingInfo{number company}} userErrors{field message}}}`;
 export async function loader({request}:LoaderFunctionArgs){
  const {session}=await authenticate.admin(request);
- const rows=await prisma.pendingTracking.findMany({where:{shop:session.shop},orderBy:{createdAt:"desc"},take:300});
+ const rows=await prisma.pendingTracking.findMany({where:{shop:session.shop},orderBy:{createdAt:"desc"},take:2000});
  return {rows:rows.map(r=>({...r,createdAt:r.createdAt.toISOString(),reviewedAt:r.reviewedAt?.toISOString()||null}))};
 }
 export async function action({request}:ActionFunctionArgs){
@@ -105,7 +105,7 @@ export default function Verification(){
  const items=rows.filter(r=>status==="HISTORY" ? ["PUBLISHED","REJECTED","ARCHIVED"].includes(r.status) : ["PENDING","FAILED"].includes(r.status));
  const available=items.filter(r=>["PENDING","FAILED"].includes(r.status));
  const chosen=available.filter(r=>selected[r.id]);
- const markVisibleReviewed=()=>setInspected(p=>({...p,...Object.fromEntries(available.map(r=>[r.id,true]))}));
+ const markVisibleReviewed=()=>setInspected(p=>({...p,...Object.fromEntries(chosen.map(r=>[r.id,true]))}));
  const removeRows=(ids:string[])=>{
   if(!ids.length||busy)return;
   if(!window.confirm(`Remove ${ids.length} record(s) from the VA queue? This archives the review records, not the Shopify orders.`))return;
@@ -125,21 +125,21 @@ export default function Verification(){
    </div>
    <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:14,flexWrap:"wrap"}}>
     <label>Status <select style={field} value={status} onChange={e=>setStatus(e.target.value)}><option value="PENDING">Needs review (pending + failed)</option><option value="HISTORY">History (published + removed)</option></select></label>
-    <button style={field} disabled={busy||!available.length} onClick={()=>setSelected(Object.fromEntries(available.map(r=>[r.id,true])))}>Select all visible</button>
+    <button style={field} disabled={busy||!available.length} onClick={()=>setSelected(Object.fromEntries(available.slice(0,100).map(r=>[r.id,true])))}>Select first 100 pending</button>
     <button style={field} disabled={busy} onClick={()=>setSelected({})}>Clear</button>
     <button style={{...field,borderColor:"#fda29b",color:"#b42318",background:"#fff5f3"}} disabled={!chosen.length||busy} onClick={()=>removeRows(chosen.map(r=>r.id))}>Remove selected ({chosen.length})</button>
-    <button style={field} disabled={busy||!available.length} onClick={markVisibleReviewed}>Mark all visible reviewed</button>
-    <strong style={{marginLeft:"auto"}}>{chosen.length} selected</strong>
+    <button style={field} disabled={busy||!chosen.length} onClick={markVisibleReviewed}>Mark selected reviewed (after checking shipments)</button>
+    <strong style={{marginLeft:"auto"}}>{chosen.length} selected (max 100 per VA approval)</strong>
    </div>
    <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}><thead><tr>{["Select","Shopify order","Destination","Carrier","Tracking","Status","Reviewed actual shipment?","Actions"].map(h=><th key={h} style={{textAlign:"left",padding:"12px 9px",background:"#f8fafc",borderBottom:"1px solid #ccd4dd",whiteSpace:"nowrap"}}>{h}</th>)}</tr></thead><tbody>{items.map(r=><tr key={r.id} style={{borderBottom:"1px solid #e5e7eb"}}>
-    <td style={{padding:9}}><input aria-label={`Select ${r.orderName}`} type="checkbox" disabled={busy||!(["PENDING","FAILED"].includes(r.status))} checked={!!selected[r.id]} onChange={e=>setSelected(p=>({...p,[r.id]:e.target.checked}))}/></td>
+    <td style={{padding:9}}><input aria-label={`Select ${r.orderName}`} type="checkbox" disabled={busy||!(["PENDING","FAILED"].includes(r.status))||(!selected[r.id]&&chosen.length>=100)} checked={!!selected[r.id]} onChange={e=>setSelected(p=>({...p,[r.id]:e.target.checked}))}/></td>
     <td style={{padding:9,fontWeight:600}}>{r.orderName}</td><td style={{padding:9}}>{r.destinationCity}, {r.destinationState||r.destinationCountry}</td><td style={{padding:9}}>{r.carrier}</td><td style={{padding:9,fontFamily:"monospace"}}>{r.trackingNumber}</td><td style={{padding:9}}><span style={pill(r.status)}>{fmtStatus(r.status)}</span>{r.lastError&&<p style={{color:"#b42318",fontSize:11}}>{r.lastError}</p>}</td>
     <td style={{padding:9,minWidth:165}}>{["PENDING","FAILED"].includes(r.status)?<label><input type="checkbox" checked={!!inspected[r.id]} onChange={e=>setInspected(p=>({...p,[r.id]:e.target.checked}))}/> Shipment reviewed</label>:r.verificationNote||"—"}</td>
     <td style={{padding:9}}><button type="button" title={`Remove ${r.orderName} from queue`} aria-label={`Remove ${r.orderName} from queue`} disabled={busy} onClick={()=>removeRows([r.id])} style={{...field,color:"#b42318",borderColor:"#fda29b",padding:"6px 10px"}}>Remove</button></td>
    </tr>)}</tbody></table></div>
    {!items.length&&<p>{status==="HISTORY" ? "No completed or archived records yet." : "You’re all caught up! No tracking records need verification."}</p>}
    <label style={{display:"block",marginTop:14}}><input type="checkbox" checked={acknowledged} onChange={e=>setAcknowledged(e.target.checked)}/> I confirm that each selected record was reviewed against its actual shipment, and its tracking number belongs to the specified order.</label>
-   <div style={{display:"flex",gap:10,marginTop:14,alignItems:"center",flexWrap:"wrap"}}><button style={{...field,background:"linear-gradient(110deg,#086342,#14c87e)",color:"white",fontWeight:700}} disabled={!chosen.length||busy||!acknowledged||chosen.some(r=>!inspected[r.id])} onClick={()=>submit("approve")}>{busy?"Processing…":`Verify selected & Update Shopify (${chosen.length})`}</button><button style={field} disabled={!chosen.length||busy||!acknowledged} onClick={()=>submit("reject")}>Reject selected</button></div>
+   <div style={{display:"flex",gap:10,marginTop:14,alignItems:"center",flexWrap:"wrap"}}><button style={{...field,background:"linear-gradient(110deg,#086342,#14c87e)",color:"white",fontWeight:700}} disabled={!chosen.length||chosen.length>100||busy||!acknowledged||chosen.some(r=>!inspected[r.id])} onClick={()=>submit("approve")}>{busy?"Processing…":`Verify selected & Update Shopify (${chosen.length})`}</button><button style={field} disabled={!chosen.length||busy||!acknowledged} onClick={()=>submit("reject")}>Reject selected</button></div>
    {fetcher.data&&"removed" in fetcher.data&&<p role="status">Archived {fetcher.data.removed} record(s) from the queue. Shopify orders and tracking are unchanged.</p>}
    {fetcher.data?.error&&<p role="alert">{fetcher.data.error}</p>}
    {fetcher.data?.results&&<div role="status" style={{marginTop:14}}><p>Successful Shopify updates move straight to History and disappear from Needs review. Verified unfulfilled orders receive a new Shopify fulfillment with tracking. Failed updates remain here.</p>{fetcher.data.results.map(r=><p key={r.id} style={{color:r.ok?"#136a42":"#b42318"}}>{r.ok?"✓":"✕"} {r.message}</p>)}</div>}
